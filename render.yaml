@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: meridian-vk-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8787
+      - key: VK_APP_ID
+        value: "54520019"
+      - key: VK_APP_SECRET
+        sync: false
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: MERIDIAN_DB_PATH
+        value: /data/db.json
+    disks:
+      - name: meridian-data
+        mountPath: /data
+        sizeGB: 1
