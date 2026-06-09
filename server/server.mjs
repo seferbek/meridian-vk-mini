@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import pg from "pg";
 
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dataDir = resolve(rootDir, "server", "data");
@@ -12,6 +13,14 @@ const vkAppId = process.env.VK_APP_ID || "";
 const vkAppSecret = process.env.VK_APP_SECRET || "";
 const vkLaunchParamsMaxAgeSeconds = Number(process.env.VK_LAUNCH_PARAMS_MAX_AGE_SECONDS || 0);
 const corsOrigin = process.env.CORS_ORIGIN || "*";
+const databaseUrl = process.env.DATABASE_URL || "";
+const pgPool = databaseUrl
+  ? new pg.Pool({
+      connectionString: databaseUrl,
+      ssl: databaseUrl.includes("sslmode=disable") ? false : { rejectUnauthorized: false },
+    })
+  : null;
+let pgInitialized = false;
 
 const defaultDb = {
   users: [],
@@ -76,6 +85,105 @@ async function loadDb() {
 async function saveDb(db) {
   await mkdir(dirname(dbPath), { recursive: true });
   await writeFile(dbPath, `${JSON.stringify({ users: db.users }, null, 2)}\n`);
+}
+
+async function initPg() {
+  if (!pgPool || pgInitialized) {
+    return;
+  }
+
+  await pgPool.query(`
+    create table if not exists users (
+      id text primary key,
+      vk_id text not null unique,
+      full_name text not null default '',
+      email text not null default '',
+      region text not null default 'Москва',
+      created_at timestamptz not null default now(),
+      survey jsonb not null default '{}'::jsonb,
+      onboarding_complete boolean not null default false,
+      favorites jsonb not null default '[]'::jsonb,
+      metrics jsonb not null default '[]'::jsonb,
+      updated_at timestamptz not null default now()
+    )
+  `);
+  pgInitialized = true;
+}
+
+function userFromPg(row) {
+  return {
+    id: row.id,
+    vkId: row.vk_id,
+    fullName: row.full_name,
+    email: row.email || "",
+    region: row.region || "Москва",
+    createdAt: new Date(row.created_at).toISOString(),
+    survey: row.survey || {},
+    onboardingComplete: Boolean(row.onboarding_complete),
+    favorites: Array.isArray(row.favorites) ? row.favorites : [],
+    metrics: Array.isArray(row.metrics) ? row.metrics : [],
+  };
+}
+
+async function findPgUserByVKId(vkUserId) {
+  await initPg();
+  const result = await pgPool.query("select * from users where vk_id = $1 limit 1", [vkUserId]);
+  return result.rows[0] ? userFromPg(result.rows[0]) : null;
+}
+
+async function insertPgUser(user) {
+  await initPg();
+  await pgPool.query(
+    `
+      insert into users (
+        id, vk_id, full_name, email, region, created_at, survey,
+        onboarding_complete, favorites, metrics, updated_at
+      )
+      values ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9::jsonb, $10::jsonb, now())
+      on conflict (vk_id) do nothing
+    `,
+    [
+      user.id,
+      user.vkId,
+      user.fullName,
+      user.email || "",
+      user.region || "Москва",
+      user.createdAt,
+      JSON.stringify(user.survey || {}),
+      Boolean(user.onboardingComplete),
+      JSON.stringify(Array.isArray(user.favorites) ? user.favorites : []),
+      JSON.stringify(Array.isArray(user.metrics) ? user.metrics : []),
+    ],
+  );
+}
+
+async function updatePgUser(user) {
+  await initPg();
+  await pgPool.query(
+    `
+      update users
+      set
+        full_name = $2,
+        email = $3,
+        region = $4,
+        survey = $5::jsonb,
+        onboarding_complete = $6,
+        favorites = $7::jsonb,
+        metrics = $8::jsonb,
+        updated_at = now()
+      where id = $1
+    `,
+    [
+      user.id,
+      user.fullName || "Пользователь",
+      user.email || "",
+      user.region || "Москва",
+      JSON.stringify(user.survey || {}),
+      Boolean(user.onboardingComplete),
+      JSON.stringify(Array.isArray(user.favorites) ? user.favorites : []),
+      JSON.stringify(Array.isArray(user.metrics) ? user.metrics : []),
+    ],
+  );
 }
 
 function readLaunchParamEntries(searchOrQuery) {
@@ -269,6 +377,38 @@ function getOrCreateVKUser(db, verified, profile) {
   return { user, isNewUser };
 }
 
+async function getOrCreatePgVKUser(verified, profile) {
+  let user = await findPgUserByVKId(verified.vkUserId);
+  const isNewUser = !user;
+
+  if (!user) {
+    user = {
+      id: crypto.randomUUID(),
+      vkId: verified.vkUserId,
+      fullName: buildNameFromProfile(profile, `Пользователь VK ${verified.vkUserId}`),
+      email: "",
+      region: "Москва",
+      createdAt: new Date().toISOString(),
+      survey: {},
+      onboardingComplete: false,
+      favorites: [],
+      metrics: [],
+    };
+    await insertPgUser(user);
+    return { user, isNewUser };
+  }
+
+  if (profile) {
+    const profileName = buildNameFromProfile(profile, user.fullName);
+    if (!user.fullName && profileName) {
+      user.fullName = profileName;
+      await updatePgUser(user);
+    }
+  }
+
+  return { user, isNewUser };
+}
+
 function applyStateToUser(user, state) {
   if (!state || !Array.isArray(state.accounts)) {
     return;
@@ -304,23 +444,36 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const db = await loadDb();
-
     if (req.method === "POST" && url.pathname === "/api/auth/vk") {
       const body = await readJsonBody(req);
       const verified = requireVKAuth(req, body);
-      const { user, isNewUser } = getOrCreateVKUser(db, verified, body.profile);
+      let user;
+      let isNewUser;
 
-      await saveDb(db);
+      if (pgPool) {
+        ({ user, isNewUser } = await getOrCreatePgVKUser(verified, body.profile));
+      } else {
+        const db = await loadDb();
+        ({ user, isNewUser } = getOrCreateVKUser(db, verified, body.profile));
+        await saveDb(db);
+      }
+
       jsonResponse(res, 200, { state: stateForUser(user), user: toPublicUser(user), isNewUser });
       return;
     }
 
     if (req.method === "GET" && url.pathname === "/api/session") {
       const verified = requireVKAuth(req);
-      const { user } = getOrCreateVKUser(db, verified);
+      let user;
 
-      await saveDb(db);
+      if (pgPool) {
+        ({ user } = await getOrCreatePgVKUser(verified));
+      } else {
+        const db = await loadDb();
+        ({ user } = getOrCreateVKUser(db, verified));
+        await saveDb(db);
+      }
+
       jsonResponse(res, 200, { state: stateForUser(user), user: toPublicUser(user) });
       return;
     }
@@ -328,10 +481,21 @@ async function handleRequest(req, res) {
     if (req.method === "PUT" && url.pathname === "/api/state") {
       const body = await readJsonBody(req);
       const verified = requireVKAuth(req, body);
-      const { user } = getOrCreateVKUser(db, verified);
+      let user;
+
+      if (pgPool) {
+        ({ user } = await getOrCreatePgVKUser(verified));
+      } else {
+        const db = await loadDb();
+        ({ user } = getOrCreateVKUser(db, verified));
+        applyStateToUser(user, body.state);
+        await saveDb(db);
+        jsonResponse(res, 200, { state: stateForUser(user), user: toPublicUser(user) });
+        return;
+      }
 
       applyStateToUser(user, body.state);
-      await saveDb(db);
+      await updatePgUser(user);
       jsonResponse(res, 200, { state: stateForUser(user), user: toPublicUser(user) });
       return;
     }
