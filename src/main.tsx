@@ -146,6 +146,15 @@ function renderFatalScreen(error: unknown) {
 }
 
 window.addEventListener("error", (event) => {
+  if (!event.error && event.message === "Script error.") {
+    console.warn("Ignored external script error without details.", {
+      filename: event.filename,
+      lineno: event.lineno,
+      colno: event.colno,
+    });
+    return;
+  }
+
   renderFatalScreen(event.error ?? event.message);
 });
 

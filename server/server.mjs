@@ -14,9 +14,10 @@ const vkAppSecret = process.env.VK_APP_SECRET || "";
 const vkLaunchParamsMaxAgeSeconds = Number(process.env.VK_LAUNCH_PARAMS_MAX_AGE_SECONDS || 0);
 const corsOrigin = process.env.CORS_ORIGIN || "*";
 const databaseUrl = process.env.DATABASE_URL || "";
+const pgConnectionString = databaseUrl.replace("sslmode=require", "sslmode=verify-full");
 const pgPool = databaseUrl
   ? new pg.Pool({
-      connectionString: databaseUrl,
+      connectionString: pgConnectionString,
       ssl: databaseUrl.includes("sslmode=disable") ? false : { rejectUnauthorized: false },
     })
   : null;
